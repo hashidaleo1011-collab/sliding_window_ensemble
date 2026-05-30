@@ -2,14 +2,29 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from .config import SWEAConfig
 
 
 class SWEAWithCache:
-    """Sliding Window Ensemble with KV-Cache (バッチ処理対応版)"""
+    """Sliding Window Ensemble with KV-Cache（バッチ処理対応版）
+
+    長いシーケンスを SINK / WINDOW / LOCAL の 3 領域に分割し、
+    複数のウィンドウ位置で予測した確率をN乗融合することで
+    推論精度を保ちながら KV キャッシュ再利用によるコスト削減を実現する。
+
+    Args:
+        model:       HuggingFace CausalLM モデル
+        tokenizer:   対応するトークナイザー
+        config:      SWEAConfig インスタンス（省略時はデフォルト値）
+        sink_size:   config を上書きする場合に指定
+        window_size: config を上書きする場合に指定
+        local_size:  config を上書きする場合に指定
+        ensemble_n:  config を上書きする場合に指定
+    """
 
     def __init__(
         self,
@@ -20,40 +35,59 @@ class SWEAWithCache:
         window_size: Optional[int] = None,
         local_size: Optional[int] = None,
         ensemble_n: Optional[float] = None,
-    ):
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
-        
-        # Config設定
+
+        # Config を構築（キーワード引数で直接渡された値を優先）
         if config is None:
-            config = SWEAConfig()
+            config = SWEAConfig(
+                sink_size=sink_size if sink_size is not None else 10,
+                window_size=window_size if window_size is not None else 512,
+                local_size=local_size if local_size is not None else 100,
+                ensemble_n=ensemble_n if ensemble_n is not None else 1.5,
+            )
+        else:
+            # 既存 config に個別上書き → _recalc() で min_tokens を再計算
+            if sink_size is not None:
+                config.sink_size = sink_size
+            if window_size is not None:
+                config.window_size = window_size
+            if local_size is not None:
+                config.local_size = local_size
+            if ensemble_n is not None:
+                config.ensemble_n = ensemble_n
+            config._recalc()
+
         self.config = config
 
-        # パラメータ上書き
-        if sink_size is not None:
-            self.config.sink_size = sink_size
-        if window_size is not None:
-            self.config.window_size = window_size
-        if local_size is not None:
-            self.config.local_size = local_size
-        if ensemble_n is not None:
-            self.config.ensemble_n = ensemble_n
+        # KV キャッシュ: key=(w_start, w_end, mid_end, content_hash) → past_key_values
+        self.kv_cache: Dict[Tuple[int, int, int, int], Any] = {}
 
-        # KVキャッシュ
-        self.kv_cache: Dict[Tuple[int, int, int], Any] = {}
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def predict_next_logits(
         self,
-        input_ids: torch.Tensor,   # (batch_size, seq_len)
+        input_ids: torch.Tensor,  # (batch_size, seq_len)
         n: Optional[float] = None,
     ) -> Tuple[torch.Tensor, str]:
-        """
-        次のトークンの確率分布を予測（バッチ処理対応）
+        """次のトークンの確率分布を返す（バッチ対応）
+
+        Args:
+            input_ids: 入力トークン列。shape = (batch_size, seq_len)
+            n:         アンサンブルのN乗係数（省略時は config.ensemble_n）
+
+        Returns:
+            (fused_probs, mode_str)
+            fused_probs: shape = (batch_size, vocab_size)
+            mode_str:    動作モードの説明文字列
         """
         _n = n if n is not None else self.config.ensemble_n
         batch_size, total_len = input_ids.shape
 
-        # 短いシーケンスの場合は通常処理
+        # シーケンスが短い場合は通常の forward で処理
         if total_len < self.config.min_tokens:
             with torch.no_grad():
                 out = self.model(input_ids)
@@ -61,37 +95,38 @@ class SWEAWithCache:
 
         mid_end = total_len - self.config.local_size
         windows = self._build_windows(total_len)
-        
+
         if not windows:
             return self._fallback(input_ids)
 
-        # ==================== バッチ化処理 ====================
-        local_ids = input_ids[:, mid_end:]                    # (batch, local_size)
-        num_windows = len(windows)
+        # ---- 1. 各ウィンドウの KV キャッシュを準備 ----
+        local_ids = input_ids[:, mid_end:]  # (batch, local_size)
+        past_list: List[Any] = []
 
-        # 1. 各ウィンドウのKVキャッシュを準備
-        past_list = []
         for w_start, w_end in windows:
+            sink_part = input_ids[:, : self.config.sink_size]
+            window_part = input_ids[:, w_start : min(w_end, mid_end)]
+            prefix_ids = torch.cat([sink_part, window_part], dim=1)
+
+            # トークン内容をハッシュ化してキーに含める
+            # → 異なるプロンプトが同じ位置でキャッシュに誤ヒットするのを防ぐ
             content_hash = hash(prefix_ids.cpu().numpy().tobytes())
-　　　　　　　　key = (w_start, w_end, mid_end, content_hash)
-            
+            key = (w_start, w_end, mid_end, content_hash)
+
             if key not in self.kv_cache:
-                # SINK + WINDOW のキャッシュ作成
-                sink_part = input_ids[:, :self.config.sink_size]
-                window_part = input_ids[:, w_start:min(w_end, mid_end)]
-                prefix_ids = torch.cat([sink_part, window_part], dim=1)
-                
                 with torch.no_grad():
                     prefix_out = self.model(prefix_ids, use_cache=True)
                 self.kv_cache[key] = prefix_out.past_key_values
-            
+
             past_list.append(self.kv_cache[key])
 
-        # 2. KVキャッシュをバッチ化
-        batched_past = self._stack_past_key_values(past_list)
+        # ---- 2. KV キャッシュをバッチ次元で結合 ----
+        num_windows = len(windows)
+        batched_past = self._stack_past_key_values(past_list, batch_size)
 
-        # 3. LOCAL部分を全ウィンドウ分まとめて処理（ここが最大の高速化ポイント）
-        batched_local = local_ids.repeat(num_windows, 1)   # (num_windows * batch, local_size)
+        # ---- 3. LOCAL 部分を全ウィンドウ分まとめて一括 forward ----
+        # (num_windows * batch_size, local_size)
+        batched_local = local_ids.repeat(num_windows, 1)
 
         with torch.no_grad():
             out = self.model(
@@ -100,61 +135,75 @@ class SWEAWithCache:
                 use_cache=False,
             )
 
-        logits = out.logits[:, -1, :]                      # (num_windows * batch, vocab_size)
+        # ---- 4. N 乗アンサンブル融合 ----
+        logits = out.logits[:, -1, :]                        # (num_windows * batch, vocab)
         probs = F.softmax(logits, dim=-1)
-
-        # 4. アンサンブル融合
-        probs = probs.view(num_windows, batch_size, -1)    # (num_windows, batch, vocab)
-        fused_probs = (probs ** _n).mean(dim=0)            # (batch, vocab)
+        probs = probs.view(num_windows, batch_size, -1)      # (num_windows, batch, vocab)
+        fused_probs = (probs ** _n).mean(dim=0)              # (batch, vocab)
         fused_probs = fused_probs / fused_probs.sum(dim=-1, keepdim=True)
 
-        mode_desc = f"batched_ensemble(w={num_windows},n={_n})"
-        return fused_probs, mode_desc
+        return fused_probs, f"batched_ensemble(w={num_windows},n={_n})"
 
-    def _stack_past_key_values(self, past_list: List) -> Tuple:
-        """複数のpast_key_valuesをバッチ次元で結合"""
-        if not past_list:
-            return None
+    def clear_cache(self) -> None:
+        """KV キャッシュを全消去する。新しい生成を開始する前に呼ぶこと。"""
+        self.kv_cache.clear()
 
-        layers = len(past_list[0])
-        batched_past = []
-
-        for layer_idx in range(layers):
-            keys = [past[layer_idx][0] for past in past_list]
-            values = [past[layer_idx][1] for past in past_list]
-            
-            batched_key = torch.cat(keys, dim=0)
-            batched_value = torch.cat(values, dim=0)
-            
-            batched_past.append((batched_key, batched_value))
-
-        return tuple(batched_past)
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
     def _build_windows(self, total_len: int) -> List[Tuple[int, int]]:
-        """ウィンドウ位置の作成（元のロジックを維持）"""
+        """ウィンドウ位置のリストを構築する。
+
+        stride = window_size // 2 の 50% オーバーラップで配置し、
+        末尾には mid_end に揃えた最終ウィンドウを必ず追加する。
+        """
         stride = self.config.window_size // 2
         mid_end = total_len - self.config.local_size
-        windows = []
+        windows: List[Tuple[int, int]] = []
         pos = self.config.sink_size
 
         while pos + self.config.window_size <= mid_end:
             windows.append((pos, pos + self.config.window_size))
             pos += stride
 
-        # 最後のウィンドウを必ず追加
+        # 末尾ウィンドウ（mid_end に右端を揃える）
         last_start = max(self.config.sink_size, mid_end - self.config.window_size)
-        if last_start >= self.config.sink_size:
-            if not windows or windows[-1][0] != last_start:
-                windows.append((last_start, mid_end))
+        if not windows or windows[-1][0] != last_start:
+            windows.append((last_start, mid_end))
 
         return windows
 
-    def _fallback(self, input_ids: torch.Tensor):
-        """フォールバック処理"""
+    def _stack_past_key_values(
+        self, past_list: List[Any], batch_size: int
+    ) -> Tuple:
+        """複数の past_key_values をバッチ次元で結合する。
+
+        キャッシュは batch_size=1 で作成されているため、
+        各ウィンドウのキャッシュを batch_size 分 repeat してから結合する。
+        結果の shape: (num_windows * batch_size, num_heads, seq_len, head_dim)
+        """
+        if not past_list:
+            return None
+
+        num_layers = len(past_list[0])
+        batched_past = []
+
+        for layer_idx in range(num_layers):
+            keys = [
+                past[layer_idx][0].repeat(batch_size, 1, 1, 1) for past in past_list
+            ]
+            values = [
+                past[layer_idx][1].repeat(batch_size, 1, 1, 1) for past in past_list
+            ]
+            batched_past.append(
+                (torch.cat(keys, dim=0), torch.cat(values, dim=0))
+            )
+
+        return tuple(batched_past)
+
+    def _fallback(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, str]:
+        """ウィンドウが作れない場合の通常 forward フォールバック"""
         with torch.no_grad():
             out = self.model(input_ids)
         return out.logits[:, -1, :], "fallback"
-
-    def clear_cache(self) -> None:
-        """新しい生成を開始する前に呼んでください"""
-        self.kv_cache.clear()
