@@ -72,7 +72,8 @@ class SWEAWithCache:
         # 1. 各ウィンドウのKVキャッシュを準備
         past_list = []
         for w_start, w_end in windows:
-            key = (w_start, w_end, mid_end)
+            content_hash = hash(prefix_ids.cpu().numpy().tobytes())
+　　　　　　　　key = (w_start, w_end, mid_end, content_hash)
             
             if key not in self.kv_cache:
                 # SINK + WINDOW のキャッシュ作成
