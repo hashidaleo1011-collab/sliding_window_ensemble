@@ -64,7 +64,7 @@ pip install torch transformers accelerate
 
 ## ⚡ クイックスタート
 
-### 基本的な使い方
+### モデルのロード
 
 ```python
 import torch
@@ -80,7 +80,10 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 model.eval()
+```
+文章生成部分
 
+```bash_
 # SWEAWithCache を初期化
 swea = SWEAWithCache(
     model=model,
