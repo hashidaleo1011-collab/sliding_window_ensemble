@@ -113,6 +113,9 @@ print(f"モード: {mode}")
 ### テキスト生成（複数トークン）
 
 ```python
+text = "こんにちは、元気ですか？"
+input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
+
 # キャッシュをリセット
 swea.clear_cache()
 
