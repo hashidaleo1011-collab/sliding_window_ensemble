@@ -4,7 +4,6 @@ import pytest
 import unittest.mock as mock
 import sys
 
-# torch / transformers をモック（実モデル不要でテスト可能にする）
 import torch
 import torch.nn.functional as F
 
@@ -13,7 +12,6 @@ def make_mock_model(vocab_size: int = 100, batch_size: int = 1):
     """SWEAWithCache が呼び出す model の最小モック"""
 
     class FakePastKeyValues:
-        """past_key_values のモック（レイヤー数=2）"""
         def __init__(self, bs=1):
             self._data = [
                 (torch.zeros(bs, 2, 5, 8), torch.zeros(bs, 2, 5, 8)),
@@ -81,7 +79,6 @@ class TestSWEAProbabilities:
     """出力確率の整合性チェック"""
 
     def test_probs_sum_to_one_short(self):
-        """短いシーケンスで確率の合計が1になること"""
         vocab_size = 50
         model = make_mock_model(vocab_size=vocab_size)
         tokenizer = make_mock_tokenizer()
@@ -95,7 +92,6 @@ class TestSWEAProbabilities:
         assert abs(total - 1.0) < 1e-4, f"確率の合計が1でない: {total:.6f}"
 
     def test_probs_non_negative(self):
-        """確率が負にならないこと"""
         vocab_size = 50
         model = make_mock_model(vocab_size=vocab_size)
         tokenizer = make_mock_tokenizer()
@@ -112,7 +108,6 @@ class TestSWEACache:
     """KV キャッシュの動作テスト"""
 
     def test_clear_cache(self):
-        """clear_cache() 後にキャッシュが空になること"""
         model = make_mock_model()
         tokenizer = make_mock_tokenizer()
         swea = SWEAWithCache(model=model, tokenizer=tokenizer)
@@ -124,7 +119,6 @@ class TestSWEACache:
         assert len(swea.kv_cache) == 0, "clear_cache() 後もキャッシュが残っている"
 
     def test_cache_key_includes_content(self):
-        """異なるトークン内容は異なるキャッシュキーになること"""
         model = make_mock_model(vocab_size=50)
         tokenizer = make_mock_tokenizer()
         swea = SWEAWithCache(model=model, tokenizer=tokenizer,
@@ -146,7 +140,6 @@ class TestSWEAConfig:
     """SWEAWithCache への config 渡しテスト"""
 
     def test_init_with_kwargs(self):
-        """キーワード引数で初期化したとき config に反映されること"""
         model = make_mock_model()
         tokenizer = make_mock_tokenizer()
         swea = SWEAWithCache(model=model, tokenizer=tokenizer,
@@ -160,7 +153,6 @@ class TestSWEAConfig:
         assert swea.config.min_tokens == 5 + 64 + 20
 
     def test_init_with_config_object(self):
-        """SWEAConfig オブジェクトを渡したとき正しく使われること"""
         model = make_mock_model()
         tokenizer = make_mock_tokenizer()
         config = SWEAConfig(sink_size=8, window_size=128, local_size=16)
@@ -170,7 +162,6 @@ class TestSWEAConfig:
         assert swea.config.min_tokens == 8 + 128 + 16
 
     def test_kwargs_override_config(self):
-        """config と kwargs を同時に渡したとき kwargs が優先されること"""
         model = make_mock_model()
         tokenizer = make_mock_tokenizer()
         config = SWEAConfig(sink_size=10, window_size=512, local_size=100)
@@ -209,7 +200,43 @@ class TestBuildWindows:
         assert len(windows) >= 1, "ウィンドウが1つも生成されない"
 
     def test_no_crash_on_minimal_sequence(self):
-        """ギリギリの長さでクラッシュしないこと"""
         swea = self._make_swea(2, 4, 2)
         windows = swea._build_windows(swea.config.min_tokens)
         assert isinstance(windows, list)
+
+
+class TestGenerateStream:
+    """generate_stream のテスト"""
+
+    def test_generate_stream_yields_strings(self):
+        """generate_stream が文字列を yield すること"""
+        vocab_size = 50
+        model = make_mock_model(vocab_size=vocab_size)
+        tokenizer = make_mock_tokenizer(eos_token_id=2)
+        tokenizer.encode = mock.MagicMock(
+            return_value=torch.zeros(1, 5, dtype=torch.long)
+        )
+        tokenizer.decode = mock.MagicMock(return_value="あ")
+        swea = SWEAWithCache(model=model, tokenizer=tokenizer,
+                             sink_size=10, window_size=32, local_size=10)
+
+        tokens = list(swea.generate_stream("テスト", max_new_tokens=5))
+
+        assert isinstance(tokens, list), "リストが返されていない"
+        assert all(isinstance(t, str) for t in tokens), "文字列以外が含まれている"
+
+    def test_generate_stream_stops_at_max_tokens(self):
+        """max_new_tokens で止まること"""
+        vocab_size = 50
+        model = make_mock_model(vocab_size=vocab_size)
+        tokenizer = make_mock_tokenizer(eos_token_id=999)  # EOS に到達しない値
+        tokenizer.encode = mock.MagicMock(
+            return_value=torch.zeros(1, 5, dtype=torch.long)
+        )
+        tokenizer.decode = mock.MagicMock(return_value="x")
+        swea = SWEAWithCache(model=model, tokenizer=tokenizer,
+                             sink_size=10, window_size=32, local_size=10)
+
+        tokens = list(swea.generate_stream("テスト", max_new_tokens=10))
+
+        assert len(tokens) <= 10, f"max_new_tokens を超えている: {len(tokens)}"
