@@ -149,6 +149,45 @@ class SWEAWithCache:
         """KV キャッシュを全消去する。新しい生成を開始する前に呼ぶこと。"""
         self.kv_cache.clear()
 
+    def generate_stream(
+        self,
+        text: str,
+        max_new_tokens: int = 100,
+        n=None,
+    ):
+        """1トークンできるたびに yield するストリーミング生成。
+
+        Args:
+            text:           入力テキスト
+            max_new_tokens: 最大生成トークン数
+            n:              アンサンブルのN乗係数（省略時は config.ensemble_n）
+
+        Yields:
+            生成されたトークンの文字列（1トークンずつ）
+
+        使い方:
+            for token in swea.generate_stream("こんにちは"):
+                print(token, end="", flush=True)
+        """
+        input_ids = self.tokenizer.encode(text, return_tensors="pt").to(
+            self.model.device
+        )
+        generated = input_ids.clone()
+        self.clear_cache()
+
+        for _ in range(max_new_tokens):
+            probs, _ = self.predict_next_logits(generated, n=n)
+            next_token_id = probs.argmax(dim=-1, keepdim=True)
+
+            if next_token_id.item() == self.tokenizer.eos_token_id:
+                break
+
+            generated = torch.cat([generated, next_token_id], dim=1)
+            token_text = self.tokenizer.decode(
+                next_token_id[0], skip_special_tokens=True
+            )
+            yield token_text
+            
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
