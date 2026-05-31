@@ -96,8 +96,8 @@ text = "こんにちは、元気ですか？"
 input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
 
 # 次のトークン予測
-logits, mode = swea.predict_next_logits(input_ids)
-next_token_id = logits.argmax(dim=-1, keepdim=True)
+probs, mode = swea.predict_next_logits(input_ids)
+next_token_id = probs.argmax(dim=-1, keepdim=True)
 next_token = tokenizer.decode(next_token_id[0])
 
 print(f"予測トークン: {next_token}")
@@ -116,8 +116,8 @@ swea.clear_cache()
 generated = input_ids.clone()
 
 for step in range(50):  # 最大50トークン生成
-    logits, mode = swea.predict_next_logits(generated)
-    next_token_id = logits.argmax(dim=-1, keepdim=True)
+    probs, mode = swea.predict_next_logits(generated)
+    next_token_id = probs.argmax(dim=-1, keepdim=True)
     
     # EOS トークンで終了
     if next_token_id.item() == tokenizer.eos_token_id:
