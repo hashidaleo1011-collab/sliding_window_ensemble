@@ -81,7 +81,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 ```
-文章生成部分
+###生成設定
 
 ```bash_
 # SWEAWithCache を初期化
