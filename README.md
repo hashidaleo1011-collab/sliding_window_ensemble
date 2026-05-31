@@ -215,7 +215,7 @@ ensemble_n = 3.0
 
 ```python
 # 622トークン以上で効果あり
-MIN_TOKENS = sink_size + window_size + local_size
+print(swea.config.min_tokens)  # 例: 622
 ```
 
 ### Q3: メモリが足りない場合は？
