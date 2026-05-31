@@ -91,7 +91,8 @@ class SWEAWithCache:
         if total_len < self.config.min_tokens:
             with torch.no_grad():
                 out = self.model(input_ids)
-            return out.logits[:, -1, :], "standard_generation"
+            probs = F.softmax(out.logits[:, -1, :], dim=-1)
+            return probs, "standard_generation"
 
         mid_end = total_len - self.config.local_size
         windows = self._build_windows(total_len)
@@ -176,34 +177,55 @@ class SWEAWithCache:
 
     def _stack_past_key_values(
         self, past_list: List[Any], batch_size: int
-    ) -> Tuple:
+    ) -> Any:
         """複数の past_key_values をバッチ次元で結合する。
 
+        transformers v4（タプル形式）と v5（DynamicCache形式）の両方に対応。
         キャッシュは batch_size=1 で作成されているため、
         各ウィンドウのキャッシュを batch_size 分 repeat してから結合する。
-        結果の shape: (num_windows * batch_size, num_heads, seq_len, head_dim)
         """
         if not past_list:
             return None
 
-        num_layers = len(past_list[0])
-        batched_past = []
+        # transformers v5: DynamicCache オブジェクトかどうか判定
+        try:
+            from transformers.cache_utils import DynamicCache
+            is_dynamic_cache = isinstance(past_list[0], DynamicCache)
+        except ImportError:
+            is_dynamic_cache = False
 
-        for layer_idx in range(num_layers):
-            keys = [
-                past[layer_idx][0].repeat(batch_size, 1, 1, 1) for past in past_list
-            ]
-            values = [
-                past[layer_idx][1].repeat(batch_size, 1, 1, 1) for past in past_list
-            ]
-            batched_past.append(
-                (torch.cat(keys, dim=0), torch.cat(values, dim=0))
-            )
+        if is_dynamic_cache:
+            # v5: DynamicCache の batch_repeat_interleave を使って結合
+            import copy
+            merged = DynamicCache()
+            for past in past_list:
+                cache_copy = copy.deepcopy(past)
+                cache_copy.batch_repeat_interleave(batch_size)
+                # 各ウィンドウのキャッシュを merged に追加
+                for layer_idx in range(len(cache_copy.layers)):
+                    layer = cache_copy.layers[layer_idx]
+                    merged.update(layer.keys, layer.values, layer_idx)
+            return merged
 
-        return tuple(batched_past)
+        else:
+            # v4: タプル形式
+            num_layers = len(past_list[0])
+            batched_past = []
+            for layer_idx in range(num_layers):
+                keys = [
+                    past[layer_idx][0].repeat(batch_size, 1, 1, 1) for past in past_list
+                ]
+                values = [
+                    past[layer_idx][1].repeat(batch_size, 1, 1, 1) for past in past_list
+                ]
+                batched_past.append(
+                    (torch.cat(keys, dim=0), torch.cat(values, dim=0))
+                )
+            return tuple(batched_past)
 
     def _fallback(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, str]:
         """ウィンドウが作れない場合の通常 forward フォールバック"""
         with torch.no_grad():
             out = self.model(input_ids)
-        return out.logits[:, -1, :], "fallback"
+        probs = F.softmax(out.logits[:, -1, :], dim=-1)
+        return probs, "fallback"
