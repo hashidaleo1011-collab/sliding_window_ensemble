@@ -93,8 +93,9 @@ swea = SWEAWithCache(
     local_size=100,
     ensemble_n=1.5
 )
-
-# 入力の準備
+```
+動作確認用コード
+```# 入力の準備
 text = "こんにちは、元気ですか？"
 input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
 
